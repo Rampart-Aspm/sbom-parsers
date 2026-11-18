@@ -1,0 +1,204 @@
+# Rampart SBOM Parsers CI & OCI Release Workflow
+name: SBOM Parsers CI & OCI Release
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      parser:
+        description: 'Specific SBOM parser to build/publish (leave empty for all)'
+        required: false
+        default: ''
+      tag:
+        description: 'Image tag override (e.g. 1.0.0)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+  attestations: write
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  discover:
+    name: Discover SBOM Parsers
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+      has_parsers: ${{ steps.set-matrix.outputs.has_parsers }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Find WASM SBOM Parsers
+        id: set-matrix
+        run: |
+          PARSERS=()
+          SPECIFIC="${{ inputs.parser }}"
+
+          if [ -n "$SPECIFIC" ] && [ -d "wasm/$SPECIFIC" ]; then
+            PARSERS+=("wasm/$SPECIFIC")
+          else
+            for dir in wasm/*/; do
+              if [ -d "$dir" ] && [ -f "$dir/main.go" ] && [ -f "$dir/parser.yaml" ]; then
+                PARSERS+=("${dir%/}")
+              fi
+            done
+          fi
+
+          if [ ${#PARSERS[@]} -eq 0 ]; then
+            echo "No WASM SBOM parsers found"
+            echo "has_parsers=false" >> "$GITHUB_OUTPUT"
+            echo "matrix=[]" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          JSON="["
+          for i in "${!PARSERS[@]}"; do
+            dir="${PARSERS[$i]}"
+            name=$(basename "$dir")
+            if [ $i -gt 0 ]; then JSON+=","; fi
+            JSON+="{\"name\":\"$name\",\"path\":\"$dir\"}"
+          done
+          JSON+="]"
+
+          echo "has_parsers=true" >> "$GITHUB_OUTPUT"
+          echo "matrix=$JSON" >> "$GITHUB_OUTPUT"
+          echo "Discovered parsers: $JSON"
+
+  test:
+    name: Test (${{ matrix.parser.name }})
+    needs: discover
+    if: needs.discover.outputs.has_parsers == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        parser: ${{ fromJson(needs.discover.outputs.matrix) }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Compile WASM Module
+        run: |
+          cd "${{ matrix.parser.path }}"
+          GOOS=wasip1 GOARCH=wasm go build -trimpath -ldflags="-s -w" -o parser.wasm .
+          ls -lh parser.wasm
+
+      - name: Run Parser Tests
+        run: |
+          go test -v ./${{ matrix.parser.path }}/...
+
+  test-pkgs:
+    name: Test Core Packages
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run Core Unit Tests
+        run: |
+          go test -v ./pkg/...
+
+  publish-oci:
+    name: Publish OCI (${{ matrix.parser.name }})
+    needs: [discover, test, test-pkgs]
+    if: needs.discover.outputs.has_parsers == 'true' && (github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        parser: ${{ fromJson(needs.discover.outputs.matrix) }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3.7.0
+
+      - name: Compile WASM Binary
+        id: compile
+        run: |
+          cd "${{ matrix.parser.path }}"
+          GOOS=wasip1 GOARCH=wasm go build -trimpath -ldflags="-s -w" -o parser.wasm .
+          
+          if [ -n "${{ inputs.tag }}" ]; then
+            VERSION="${{ inputs.tag }}"
+          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            VERSION="${{ github.ref_name }}"
+          else
+            VERSION="v1"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Determine OCI Image Tags
+        id: meta
+        run: |
+          OWNER="${GITHUB_REPOSITORY_OWNER,,}"
+          PARSER_NAME="${{ matrix.parser.name }}"
+          VERSION="${{ steps.compile.outputs.version }}"
+          IMAGE="$REGISTRY/$OWNER/sbom-parsers/$PARSER_NAME"
+
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+          echo "tag_version=$IMAGE:$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag_latest=$IMAGE:latest" >> "$GITHUB_OUTPUT"
+
+      - name: Build and Push OCI Artifact
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.parser.path }}
+          file: ${{ matrix.parser.path }}/Dockerfile
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.tag_version }}
+            ${{ steps.meta.outputs.tag_latest }}
+
+      - name: Attest SLSA L3 Provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ steps.meta.outputs.image }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: Sign OCI Artifact (Cosign Keyless)
+        env:
+          REF: ${{ steps.meta.outputs.image }}@${{ steps.build.outputs.digest }}
+        run: |
+          cosign sign --yes "$REF"

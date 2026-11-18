@@ -1,0 +1,24 @@
+apiVersion: rampart.aspm.dev/v1alpha1
+kind: ClusterSBOMParser
+metadata:
+  name: sbom-spdx
+spec:
+  format: spdx
+  runtime: wasm
+  version: "1.0.0"
+  description: "SPDX SBOM parser supporting JSON, YAML, and Tag-Value formats"
+  detect:
+    filenames:
+      - "*spdx*.json"
+      - "*spdx*.spdx"
+      - "*.spdx.json"
+    probes:
+      - jsonHasKeys:
+          - spdxVersion
+      - contains:
+          - "SPDXVersion:"
+  source:
+    oci: ghcr.io/rampart-aspm/sbom-parsers/sbom-spdx:latest
+  limits:
+    maxMemoryMB: 256
+    timeoutSeconds: 60

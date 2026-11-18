@@ -1,0 +1,25 @@
+apiVersion: rampart.aspm.dev/v1alpha1
+kind: ClusterSBOMParser
+metadata:
+  name: sbom-cyclonedx
+spec:
+  format: cyclonedx
+  runtime: wasm
+  version: "1.0.0"
+  description: "CycloneDX SBOM parser (JSON/XML) with component dependency graph and VDR vulnerabilities"
+  detect:
+    filenames:
+      - "*cyclonedx*.json"
+      - "*cyclonedx*.xml"
+      - "*.cdx.json"
+      - "*.cdx.xml"
+    probes:
+      - jsonHasKeys:
+          - bomFormat
+      - contains:
+          - "<bom"
+  source:
+    oci: ghcr.io/rampart-aspm/sbom-parsers/sbom-cyclonedx:latest
+  limits:
+    maxMemoryMB: 256
+    timeoutSeconds: 60

@@ -1,0 +1,15 @@
+{
+  "descriptor": {"name": "syft", "version": "1.0.1"},
+  "source": {"id": "src-1", "name": "ecommerce-api", "version": "1.0.0", "type": "directory", "target": "."},
+  "artifacts": [
+    {
+      "id": "art-express",
+      "name": "express",
+      "version": "4.18.2",
+      "type": "npm",
+      "purl": "pkg:npm/express@4.18.2",
+      "licenses": [{"value": "MIT", "spdxExpression": "MIT"}]
+    }
+  ],
+  "artifactRelationships": []
+}
