@@ -88,10 +88,10 @@ func TestSPDX_Wasm_ComplexGraph(t *testing.T) {
 
 	scanner := bufio.NewScanner(bytes.NewReader(stdout))
 	var (
-		metadataFound  bool
-		components     = make(map[string]map[string]any)
-		edges          []map[string]any
-		directEdgeCount int
+		metadataFound       bool
+		components          = make(map[string]map[string]any)
+		edges               []map[string]any
+		directEdgeCount     int
 		transitiveEdgeCount int
 	)
 
@@ -215,10 +215,7 @@ func TestSPDX_Wasm_TagValue(t *testing.T) {
 	}
 
 	scanner := bufio.NewScanner(bytes.NewReader(stdout))
-	var (
-		compFound bool
-		vulnFound bool
-	)
+	var compFound bool
 	for scanner.Scan() {
 		var raw map[string]any
 		_ = json.Unmarshal(scanner.Bytes(), &raw)
@@ -232,17 +229,88 @@ func TestSPDX_Wasm_TagValue(t *testing.T) {
 				t.Errorf("expected purl_base pkg:generic/openssl, got %v", raw["purl_base"])
 			}
 		case "vulnerability":
-			vulnFound = true
-			if id, ok := raw["id"].(string); !ok || !strings.Contains(id, "openssl") {
-				t.Errorf("expected vulnerability for openssl, got %v", raw["id"])
-			}
+			// the sample carries a CPE reference: an identifier of the package, never a vulnerability
+			t.Fatalf("an SBOM yields no vulnerabilities, got %s", scanner.Text())
 		}
 	}
 
 	if !compFound {
 		t.Errorf("expected openssl component to be emitted")
 	}
-	if !vulnFound {
-		t.Errorf("expected CPE vulnerability to be extracted when EXTRACT_VULNERABILITIES=true")
+}
+
+// Input that names no SPDX version is not SPDX: the module fails instead of reporting an empty SPDX 2.3 inventory.
+func TestSPDX_Wasm_RefusesInputThatIsNotSPDX(t *testing.T) {
+	ctx := context.Background()
+	wasmCode, err := os.ReadFile(compileWasm(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, in := range map[string]string{
+		"plain text":              "this is not an SBOM\n",
+		"a CycloneDX document":    `{"bomFormat":"CycloneDX","specVersion":"1.5","components":[]}`,
+		"an unrelated JSON":       `{"hello":"world"}`,
+		"tag-value without a tag": "Creator: Tool: x\nPackageName: a\n",
+	} {
+		stdout, stderr, err := runWasm(ctx, t, wasmCode, []byte(in), nil)
+		if err == nil {
+			t.Errorf("%s: the module accepted it and wrote %q", name, string(stdout))
+			continue
+		}
+		if !strings.Contains(string(stderr), "not an SPDX document") {
+			t.Errorf("%s: stderr does not say why: %q", name, string(stderr))
+		}
+	}
+}
+
+// Every SPDX relationship that states a dependency becomes an edge, whichever way round it is written: "A DEPENDS_ON B" and
+// "B RUNTIME_DEPENDENCY_OF A" are the same edge from A to B. A relationship that is not about dependencies adds none.
+func TestSPDX_Wasm_EveryDependencyRelationshipBecomesAnEdge(t *testing.T) {
+	ctx := context.Background()
+	wasmCode, err := os.ReadFile(compileWasm(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc := []byte(`{
+  "spdxVersion": "SPDX-2.3", "SPDXID": "SPDXRef-DOCUMENT", "name": "app", "dataLicense": "CC0-1.0",
+  "documentDescribes": ["SPDXRef-app"],
+  "packages": [
+    {"SPDXID": "SPDXRef-app", "name": "app", "versionInfo": "1"},
+    {"SPDXID": "SPDXRef-a", "name": "a", "versionInfo": "1"},
+    {"SPDXID": "SPDXRef-b", "name": "b", "versionInfo": "1"},
+    {"SPDXID": "SPDXRef-c", "name": "c", "versionInfo": "1"},
+    {"SPDXID": "SPDXRef-d", "name": "d", "versionInfo": "1"},
+    {"SPDXID": "SPDXRef-e", "name": "e", "versionInfo": "1"}
+  ],
+  "relationships": [
+    {"spdxElementId": "SPDXRef-DOCUMENT", "relationshipType": "DESCRIBES", "relatedSpdxElement": "SPDXRef-app"},
+    {"spdxElementId": "SPDXRef-app", "relationshipType": "DEPENDS_ON", "relatedSpdxElement": "SPDXRef-a"},
+    {"spdxElementId": "SPDXRef-b", "relationshipType": "RUNTIME_DEPENDENCY_OF", "relatedSpdxElement": "SPDXRef-app"},
+    {"spdxElementId": "SPDXRef-c", "relationshipType": "BUILD_DEPENDENCY_OF", "relatedSpdxElement": "SPDXRef-a"},
+    {"spdxElementId": "SPDXRef-d", "relationshipType": "TEST_DEPENDENCY_OF", "relatedSpdxElement": "SPDXRef-a"},
+    {"spdxElementId": "SPDXRef-e", "relationshipType": "DEPENDENCY_MANIFEST_OF", "relatedSpdxElement": "SPDXRef-a"}
+  ]
+}`)
+	stdout, stderr, err := runWasm(ctx, t, wasmCode, doc, nil)
+	if err != nil {
+		t.Fatalf("%v\n%s", err, stderr)
+	}
+	got := map[string]bool{}
+	sc := bufio.NewScanner(bytes.NewReader(stdout))
+	for sc.Scan() {
+		var ev map[string]any
+		_ = json.Unmarshal(sc.Bytes(), &ev)
+		if ev["type"] == "edge" {
+			got[ev["from"].(string)+">"+ev["to"].(string)] = true
+		}
+	}
+	want := []string{"SPDXRef-app>SPDXRef-a", "SPDXRef-app>SPDXRef-b", "SPDXRef-a>SPDXRef-c", "SPDXRef-a>SPDXRef-d"}
+	for _, w := range want {
+		if !got[w] {
+			t.Errorf("missing edge %s; got %v", w, got)
+		}
+	}
+	if len(got) != len(want) {
+		t.Errorf("a relationship that is not about dependencies added an edge: %v", got)
 	}
 }

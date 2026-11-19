@@ -1,0 +1,15 @@
+{{- /*
+One ClusterSBOMParser for each file of manifests/ (scripts/sync-chart.sh copies the parser.yaml that sits next to each reader's code).
+Nothing about a reader is written in this template: add a reader by adding its manifest. Its value key is its name without "sbom-".
+*/ -}}
+{{- $all := .Values.defaultSBOMParsers | default dict }}
+{{- if ternary $all.enabled true (hasKey $all "enabled") }}
+{{- range $path, $_ := .Files.Glob "manifests/*.yaml" }}
+{{- $m := $.Files.Get $path | fromYaml }}
+{{- $one := index $all (trimPrefix "sbom-" $m.metadata.name) | default dict }}
+{{- if ternary $one.enabled true (hasKey $one "enabled") }}
+---
+{{ include "rampart-sbom-parsers.render" (dict "m" $m "one" $one "root" $) }}
+{{- end }}
+{{- end }}
+{{- end }}

@@ -5,21 +5,23 @@ metadata:
 spec:
   format: cyclonedx
   runtime: wasm
-  version: "1.0.0"
-  description: "CycloneDX SBOM parser (JSON/XML) with component dependency graph and VDR vulnerabilities"
+  source:
+    oci: ghcr.io/rampart-aspm/sbom-parsers/sbom-cyclonedx:v1
+  description: CycloneDX 1.4-1.6 streaming WASM SBOM parser
   detect:
     filenames:
-      - "*cyclonedx*.json"
-      - "*cyclonedx*.xml"
-      - "*.cdx.json"
-      - "*.cdx.xml"
+    - '*cyclonedx*'
+    - '*.cdx.json'
+    - '*.cdx.xml'
+    contentTypes:
+    - '*cyclonedx*'
     probes:
-      - jsonHasKeys:
-          - bomFormat
-      - contains:
-          - "<bom"
-  source:
-    oci: ghcr.io/rampart-aspm/sbom-parsers/sbom-cyclonedx:latest
-  limits:
-    maxMemoryMB: 256
-    timeoutSeconds: 60
+    - jsonHasKeys:
+      - bomFormat
+    - contains:
+      - '<bom'
+      - 'cyclonedx.org'
+  options:
+    buildDependencyGraph: true
+    # Findings from the vulnerabilities the document itself states (a VDR). Off: an SBOM is assets (D131).
+    extractVulnerabilities: false

@@ -5,20 +5,22 @@ metadata:
 spec:
   format: spdx
   runtime: wasm
-  version: "1.0.0"
-  description: "SPDX SBOM parser supporting JSON, YAML, and Tag-Value formats"
+  source:
+    oci: ghcr.io/rampart-aspm/sbom-parsers/sbom-spdx:v1
+  description: SPDX 2.2, 2.3, and 3.0 streaming WASM SBOM parser
   detect:
     filenames:
-      - "*spdx*.json"
-      - "*spdx*.spdx"
-      - "*.spdx.json"
+    - '*spdx*'
+    - '*.spdx.json'
+    - '*.spdx'
+    - '*.spdx.jsonld'
+    contentTypes:
+    - '*spdx*'
     probes:
-      - jsonHasKeys:
-          - spdxVersion
-      - contains:
-          - "SPDXVersion:"
-  source:
-    oci: ghcr.io/rampart-aspm/sbom-parsers/sbom-spdx:latest
-  limits:
-    maxMemoryMB: 256
-    timeoutSeconds: 60
+    - jsonHasKeys:
+      - spdxVersion
+    - contains:
+      - 'SPDXVersion:'
+      - '@graph'
+  options:
+    buildDependencyGraph: true

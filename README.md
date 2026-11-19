@@ -41,7 +41,7 @@ Rampart eliminates monolithic, hardcoded SBOM readers in favor of decoupled, out
 |---|---|---|---|---|
 | `sbom-cyclonedx` | CycloneDX | v1.2, v1.3, v1.4, v1.5, v1.6 (JSON & XML) | Components, dependencies, purl/CPE normalization, VDR vulnerabilities | `ghcr.io/rampart-aspm/sbom-parsers/sbom-cyclonedx:latest` |
 | `sbom-spdx` | SPDX | v2.2, v2.3 (JSON, YAML, Tag-Value) | Packages, dependency relationships (`DEPENDS_ON`, `CONTAINS`), licenses | `ghcr.io/rampart-aspm/sbom-parsers/sbom-spdx:latest` |
-| `syft` | Anchore Syft | Syft JSON schema | Artifact catalogs, language ecosystems, coordinates, dependency graphs | `ghcr.io/rampart-aspm/sbom-parsers/syft:latest` |
+| `sbom-syft` | Anchore Syft | Syft JSON schema | Artifact catalog as components, artifact relationships as dependency edges (assets only, no findings) | `ghcr.io/rampart-aspm/sbom-parsers/sbom-syft:latest` |
 
 ---
 

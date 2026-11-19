@@ -1,0 +1,14 @@
+apiVersion: v2
+name: rampart-sbom-parsers
+description: "The default SBOM readers of Rampart (ClusterSBOMParser resources), for CycloneDX, SPDX and Syft. Everything is on by default; each reader can be turned off."
+type: application
+# The version of the set. A change to any reader's detection or settings is a new version.
+version: 0.1.0
+appVersion: "0.1.0"
+kubeVersion: ">=1.25.0-0"
+keywords: [rampart, aspm, sbom, cyclonedx, spdx, syft]
+sources:
+  - https://github.com/Rampart-Aspm/sbom-parsers
+annotations:
+  artifacthub.io/category: security
+  rampart.aspm.dev/needs-crds: "ClusterSBOMParser"

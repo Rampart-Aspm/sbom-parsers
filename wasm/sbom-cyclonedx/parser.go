@@ -6,23 +6,43 @@ import (
 	"encoding/xml"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 
 	"github.com/rampart-aspm/sbom-parsers/pkg/normalize"
 )
 
-// Options controls how the SBOM parser handles optional sections (like embedded CVEs).
+// Options are the options of the reader. The host passes them in the environment.
 type Options struct {
-	ExtractVulnerabilities bool `json:"extract_vulnerabilities"`
+	// ExtractVulnerabilities makes the reader emit the vulnerabilities a document states in its "vulnerabilities"
+	// section (a VDR). It is off by default: an SBOM is assets, and what is found in it is the matcher's work. It reads
+	// that section only: never the CPE of a component, which is a guess and not a statement.
+	ExtractVulnerabilities bool
 }
 
 // Event types emitted as JSONL to stdout
 const (
-	EventMetadata      = "metadata"
-	EventComponent     = "component"
-	EventEdge          = "edge"
+	EventMetadata  = "metadata"
+	EventComponent = "component"
+	EventEdge      = "edge"
+
 	EventVulnerability = "vulnerability"
 )
+
+// VulnerabilityEvent is one vulnerability a VDR states about one component (one event per affected reference).
+type VulnerabilityEvent struct {
+	Type        string   `json:"type"`
+	ID          string   `json:"id"`
+	Source      string   `json:"source,omitempty"`
+	Severity    string   `json:"severity,omitempty"`
+	Score       float64  `json:"score,omitempty"`
+	Vector      string   `json:"vector,omitempty"`
+	CWEs        []int    `json:"cwes,omitempty"`
+	AffectedRef string   `json:"affected_ref"`
+	Description string   `json:"description,omitempty"`
+	Detail      string   `json:"detail,omitempty"`
+	Aliases     []string `json:"aliases,omitempty"`
+}
 
 // MetadataEvent describes top-level SBOM information.
 type MetadataEvent struct {
@@ -59,18 +79,6 @@ type EdgeEvent struct {
 	Direct bool   `json:"direct"`
 }
 
-// VulnerabilityEvent describes an embedded CVE / VDR finding.
-type VulnerabilityEvent struct {
-	Type        string  `json:"type"`
-	ID          string  `json:"id"`
-	Severity    string  `json:"severity,omitempty"`
-	Score       float64 `json:"score,omitempty"`
-	CWEs        []int   `json:"cwes,omitempty"`
-	AffectedRef string  `json:"affected_ref,omitempty"`
-	Description string  `json:"description,omitempty"`
-	Detail      string  `json:"detail,omitempty"`
-}
-
 // raw structures for streaming unmarshal (JSON)
 type cdxMetadata struct {
 	Timestamp string `json:"timestamp"`
@@ -103,6 +111,9 @@ type cdxComponent struct {
 		Alg     string `json:"alg"`
 		Content string `json:"content"`
 	} `json:"hashes"`
+	// Components nested in a component (an assembly, a bundled library) are components of the document like any other:
+	// a dependency can name one by its bom-ref.
+	Components []cdxComponent `json:"components"`
 }
 
 type cdxDependency struct {
@@ -111,18 +122,26 @@ type cdxDependency struct {
 }
 
 type cdxVulnerability struct {
-	ID          string `json:"id"`
+	ID     string `json:"id"`
+	Source struct {
+		Name string `json:"name"`
+	} `json:"source"`
 	Description string `json:"description"`
 	Detail      string `json:"detail"`
 	Ratings     []struct {
 		Severity string  `json:"severity"`
 		Score    float64 `json:"score"`
 		Method   string  `json:"method"`
+		Vector   string  `json:"vector"`
 	} `json:"ratings"`
 	CWEs    []int `json:"cwes"`
 	Affects []struct {
 		Ref string `json:"ref"`
 	} `json:"affects"`
+	// References lists the same vulnerability under other ids (a GHSA for a CVE, for example).
+	References []struct {
+		ID string `json:"id"`
+	} `json:"references"`
 }
 
 // raw structures for unmarshal (XML)
@@ -150,6 +169,8 @@ type cdxXMLComponent struct {
 	Scope    string          `xml:"scope"`
 	Licenses []cdxXMLLicense `xml:"licenses>license"`
 	Hashes   []cdxXMLHash    `xml:"hashes>hash"`
+	// Nested components, as in JSON.
+	Components []cdxXMLComponent `xml:"components>component"`
 }
 
 type cdxXMLLicense struct {
@@ -174,6 +195,7 @@ type cdxXMLDependencyRef struct {
 type cdxXMLVulnerability struct {
 	BOMRef      string             `xml:"bom-ref,attr"`
 	ID          string             `xml:"id"`
+	Source      cdxXMLSource       `xml:"source"`
 	Description string             `xml:"description"`
 	Detail      string             `xml:"detail"`
 	Ratings     []cdxXMLRating     `xml:"ratings>rating"`
@@ -181,10 +203,41 @@ type cdxXMLVulnerability struct {
 	Affects     []cdxXMLAffectsRef `xml:"affects>target"`
 }
 
+type cdxXMLSource struct {
+	Name string `xml:"name,attr"`
+}
+
 type cdxXMLRating struct {
-	Severity string  `xml:"severity"`
-	Score    float64 `xml:"score"`
-	Method   string  `xml:"method"`
+	Severity string      `xml:"severity"`
+	Score    cdxXMLScore `xml:"score"`
+	Method   string      `xml:"method"`
+	Vector   string      `xml:"vector"`
+}
+
+// cdxXMLScore reads a rating score in either form: <score><base>7.5</base></score> (the schema) or <score>7.5</score>.
+type cdxXMLScore float64
+
+func (s *cdxXMLScore) UnmarshalXML(d *xml.Decoder, start xml.StartElement) error {
+	var v struct {
+		Base string `xml:"base"`
+		Text string `xml:",chardata"`
+	}
+	if err := d.DecodeElement(&v, &start); err != nil {
+		return err
+	}
+	txt := strings.TrimSpace(v.Base)
+	if txt == "" {
+		txt = strings.TrimSpace(v.Text)
+	}
+	if txt == "" {
+		return nil
+	}
+	f, err := strconv.ParseFloat(txt, 64)
+	if err != nil {
+		return nil // a score that is not a number is no score; the severity label still counts
+	}
+	*s = cdxXMLScore(f)
+	return nil
 }
 
 type cdxXMLAffectsRef struct {
@@ -281,49 +334,9 @@ func parseCycloneDXXMLStream(r io.Reader, w io.Writer, opts Options) error {
 	}
 
 	for _, comp := range doc.Components {
-		ref := comp.BOMRef
-		if ref == "" {
-			ref = comp.Purl
+		for _, ev := range xmlComponentEvents(comp, rootRef) {
+			_ = emit(ev)
 		}
-		if ref == "" {
-			ref = comp.Name + "@" + comp.Version
-		}
-
-		var licenses []string
-		for _, lic := range comp.Licenses {
-			if lic.ID != "" {
-				licenses = append(licenses, lic.ID)
-			} else if lic.Name != "" {
-				licenses = append(licenses, lic.Name)
-			}
-		}
-
-		hashes := make(map[string]string)
-		for _, h := range comp.Hashes {
-			if h.Alg != "" && h.Value != "" {
-				hashes[strings.ToUpper(h.Alg)] = strings.TrimSpace(h.Value)
-			}
-		}
-
-		purlBase := ""
-		if comp.Purl != "" {
-			_, purlBase, _ = normalize.CanonicalPURL(comp.Purl)
-		}
-
-		_ = emit(ComponentEvent{
-			Type:     EventComponent,
-			Ref:      ref,
-			Name:     comp.Name,
-			Group:    comp.Group,
-			Version:  comp.Version,
-			Purl:     comp.Purl,
-			PurlBase: purlBase,
-			CompType: comp.Type,
-			Scope:    comp.Scope,
-			Licenses: licenses,
-			Hashes:   hashes,
-			IsRoot:   ref == rootRef,
-		})
 	}
 
 	directSet := make(map[string]bool)
@@ -356,28 +369,152 @@ func parseCycloneDXXMLStream(r io.Reader, w io.Writer, opts Options) error {
 
 	if opts.ExtractVulnerabilities {
 		for _, v := range doc.Vulns {
-			severity := ""
-			score := 0.0
-			if len(v.Ratings) > 0 {
-				severity = v.Ratings[0].Severity
-				score = v.Ratings[0].Score
+			ratings := make([]rating, 0, len(v.Ratings))
+			for _, r := range v.Ratings {
+				ratings = append(ratings, rating{severity: r.Severity, score: float64(r.Score), vector: r.Vector})
 			}
-
-			for _, aff := range v.Affects {
-				_ = emit(VulnerabilityEvent{
-					Type:        EventVulnerability,
-					ID:          v.ID,
-					Severity:    severity,
-					Score:       score,
-					CWEs:        v.CWEs,
-					AffectedRef: aff.Ref,
-					Description: v.Description,
-					Detail:      v.Detail,
-				})
+			refs := make([]string, 0, len(v.Affects))
+			for _, a := range v.Affects {
+				refs = append(refs, a.Ref)
+			}
+			if err := emitVulnerability(emit, v.ID, v.Source.Name, v.Description, v.Detail, ratings, v.CWEs, refs, nil); err != nil {
+				return err
 			}
 		}
 	}
 
+	return nil
+}
+
+// jsonComponentEvents is the component, then the components nested in it, in document order.
+func jsonComponentEvents(comp cdxComponent, rootRef string) []ComponentEvent {
+	ref := comp.BOMRef
+	if ref == "" {
+		ref = comp.Purl
+	}
+	if ref == "" {
+		ref = comp.Name + "@" + comp.Version
+	}
+	var licenses []string
+	for _, lic := range comp.Licenses {
+		switch {
+		case lic.License.ID != "":
+			licenses = append(licenses, lic.License.ID)
+		case lic.License.Name != "":
+			licenses = append(licenses, lic.License.Name)
+		case lic.Expression != "":
+			licenses = append(licenses, lic.Expression)
+		}
+	}
+	hashes := make(map[string]string)
+	for _, h := range comp.Hashes {
+		if h.Alg != "" && h.Content != "" {
+			hashes[strings.ToUpper(h.Alg)] = h.Content
+		}
+	}
+	purlBase := ""
+	if comp.Purl != "" {
+		_, purlBase, _ = normalize.CanonicalPURL(comp.Purl)
+	}
+	out := []ComponentEvent{{
+		Type: EventComponent, Ref: ref, Name: comp.Name, Group: comp.Group, Version: comp.Version, Purl: comp.Purl, PurlBase: purlBase,
+		CompType: comp.Type, Scope: comp.Scope, Licenses: licenses, Hashes: hashes, IsRoot: ref == rootRef,
+	}}
+	for _, sub := range comp.Components {
+		out = append(out, jsonComponentEvents(sub, rootRef)...)
+	}
+	return out
+}
+
+// xmlComponentEvents is jsonComponentEvents for a document in XML.
+func xmlComponentEvents(comp cdxXMLComponent, rootRef string) []ComponentEvent {
+	ref := comp.BOMRef
+	if ref == "" {
+		ref = comp.Purl
+	}
+	if ref == "" {
+		ref = comp.Name + "@" + comp.Version
+	}
+	var licenses []string
+	for _, lic := range comp.Licenses {
+		if lic.ID != "" {
+			licenses = append(licenses, lic.ID)
+		} else if lic.Name != "" {
+			licenses = append(licenses, lic.Name)
+		}
+	}
+	hashes := make(map[string]string)
+	for _, h := range comp.Hashes {
+		if h.Alg != "" && h.Value != "" {
+			hashes[strings.ToUpper(h.Alg)] = strings.TrimSpace(h.Value)
+		}
+	}
+	purlBase := ""
+	if comp.Purl != "" {
+		_, purlBase, _ = normalize.CanonicalPURL(comp.Purl)
+	}
+	out := []ComponentEvent{{
+		Type: EventComponent, Ref: ref, Name: comp.Name, Group: comp.Group, Version: comp.Version, Purl: comp.Purl, PurlBase: purlBase,
+		CompType: comp.Type, Scope: comp.Scope, Licenses: licenses, Hashes: hashes, IsRoot: ref == rootRef,
+	}}
+	for _, sub := range comp.Components {
+		out = append(out, xmlComponentEvents(sub, rootRef)...)
+	}
+	return out
+}
+
+// rating is one rating of a vulnerability, whichever format it came from.
+type rating struct {
+	severity string
+	score    float64
+	vector   string
+}
+
+// bestRating picks the rating that says the most: the highest score, and when no rating has a score, the most severe label.
+func bestRating(rs []rating) rating {
+	var best rating
+	for i, r := range rs {
+		if i == 0 || r.score > best.score || (r.score == best.score && severityRank(r.severity) > severityRank(best.severity)) {
+			best = r
+		}
+	}
+	return best
+}
+
+func severityRank(s string) int {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "critical":
+		return 5
+	case "high":
+		return 4
+	case "medium", "moderate":
+		return 3
+	case "low":
+		return 2
+	case "info", "informational":
+		return 1
+	}
+	return 0
+}
+
+// emitVulnerability writes one event for each component the vulnerability affects. A vulnerability that names no
+// component is dropped: there is nothing it could be attached to.
+func emitVulnerability(emit func(any) error, id, source, description, detail string, ratings []rating, cwes []int, refs, aliases []string) error {
+	if strings.TrimSpace(id) == "" {
+		return nil
+	}
+	best := bestRating(ratings)
+	for _, ref := range refs {
+		if ref == "" {
+			continue
+		}
+		if err := emit(VulnerabilityEvent{
+			Type: EventVulnerability, ID: id, Source: source, Severity: best.severity, Score: best.score, Vector: best.vector,
+			CWEs: cwes, AffectedRef: ref, Description: description, Detail: detail, Aliases: aliases,
+		}); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -488,51 +625,9 @@ func parseCycloneDXJSONStream(r io.Reader, w io.Writer, opts Options) error {
 					return fmt.Errorf("failed to decode component: %w", err)
 				}
 
-				ref := comp.BOMRef
-				if ref == "" {
-					ref = comp.Purl
+				for _, ev := range jsonComponentEvents(comp, rootRef) {
+					_ = emit(ev)
 				}
-				if ref == "" {
-					ref = comp.Name + "@" + comp.Version
-				}
-
-				var licenses []string
-				for _, lic := range comp.Licenses {
-					if lic.License.ID != "" {
-						licenses = append(licenses, lic.License.ID)
-					} else if lic.License.Name != "" {
-						licenses = append(licenses, lic.License.Name)
-					} else if lic.Expression != "" {
-						licenses = append(licenses, lic.Expression)
-					}
-				}
-
-				hashes := make(map[string]string)
-				for _, h := range comp.Hashes {
-					if h.Alg != "" && h.Content != "" {
-						hashes[strings.ToUpper(h.Alg)] = h.Content
-					}
-				}
-
-				purlBase := ""
-				if comp.Purl != "" {
-					_, purlBase, _ = normalize.CanonicalPURL(comp.Purl)
-				}
-
-				_ = emit(ComponentEvent{
-					Type:     EventComponent,
-					Ref:      ref,
-					Name:     comp.Name,
-					Group:    comp.Group,
-					Version:  comp.Version,
-					Purl:     comp.Purl,
-					PurlBase: purlBase,
-					CompType: comp.Type,
-					Scope:    comp.Scope,
-					Licenses: licenses,
-					Hashes:   hashes,
-					IsRoot:   ref == rootRef,
-				})
 			}
 			if err := expectDelim(dec, ']'); err != nil {
 				return err
@@ -588,36 +683,32 @@ func parseCycloneDXJSONStream(r io.Reader, w io.Writer, opts Options) error {
 				if err := skipValue(dec); err != nil {
 					return err
 				}
-				continue
+				break
 			}
-
 			if err := expectDelim(dec, '['); err != nil {
 				return err
 			}
 			for dec.More() {
-				var vuln cdxVulnerability
-				if err := dec.Decode(&vuln); err != nil {
-					return fmt.Errorf("failed to decode vulnerability: %w", err)
+				var v cdxVulnerability
+				if err := dec.Decode(&v); err != nil {
+					return fmt.Errorf("reading a vulnerability: %w", err)
 				}
-
-				severity := ""
-				score := 0.0
-				if len(vuln.Ratings) > 0 {
-					severity = vuln.Ratings[0].Severity
-					score = vuln.Ratings[0].Score
+				ratings := make([]rating, 0, len(v.Ratings))
+				for _, r := range v.Ratings {
+					ratings = append(ratings, rating{severity: r.Severity, score: r.Score, vector: r.Vector})
 				}
-
-				for _, aff := range vuln.Affects {
-					_ = emit(VulnerabilityEvent{
-						Type:        EventVulnerability,
-						ID:          vuln.ID,
-						Severity:    severity,
-						Score:       score,
-						CWEs:        vuln.CWEs,
-						AffectedRef: aff.Ref,
-						Description: vuln.Description,
-						Detail:      vuln.Detail,
-					})
+				refs := make([]string, 0, len(v.Affects))
+				for _, a := range v.Affects {
+					refs = append(refs, a.Ref)
+				}
+				var aliases []string
+				for _, r := range v.References {
+					if r.ID != "" && r.ID != v.ID {
+						aliases = append(aliases, r.ID)
+					}
+				}
+				if err := emitVulnerability(emit, v.ID, v.Source.Name, v.Description, v.Detail, ratings, v.CWEs, refs, aliases); err != nil {
+					return err
 				}
 			}
 			if err := expectDelim(dec, ']'); err != nil {

@@ -10,17 +10,15 @@ import (
 	"github.com/rampart-aspm/sbom-parsers/pkg/normalize"
 )
 
-// Options controls how the SBOM parser handles optional sections.
-type Options struct {
-	ExtractVulnerabilities bool `json:"extract_vulnerabilities"`
-}
+// Options is reserved for options of the reader. An SBOM is assets: a CPE reference is an identifier of the package, not a
+// vulnerability, and nothing here turns one into a finding (docs/34 section 0b).
+type Options struct{}
 
 // Event types emitted as JSONL to stdout
 const (
-	EventMetadata      = "metadata"
-	EventComponent     = "component"
-	EventEdge          = "edge"
-	EventVulnerability = "vulnerability"
+	EventMetadata  = "metadata"
+	EventComponent = "component"
+	EventEdge      = "edge"
 )
 
 // MetadataEvent describes top-level SBOM information.
@@ -56,16 +54,6 @@ type EdgeEvent struct {
 	From   string `json:"from"`
 	To     string `json:"to"`
 	Direct bool   `json:"direct"`
-}
-
-// VulnerabilityEvent describes an embedded CVE / security finding.
-type VulnerabilityEvent struct {
-	Type        string  `json:"type"`
-	ID          string  `json:"id"`
-	Severity    string  `json:"severity,omitempty"`
-	Score       float64 `json:"score,omitempty"`
-	AffectedRef string  `json:"affected_ref,omitempty"`
-	Description string  `json:"description,omitempty"`
 }
 
 // ParseSPDXStream streams SPDX (JSON, JSON-LD, or Tag-Value) into line-delimited JSON events.
@@ -160,6 +148,7 @@ func parseSPDXJSONStream(r io.Reader, emit func(any) error, opts Options) error 
 		toolName          = ""
 		timestamp         = ""
 		emittedMetadata   = false
+		sawVersion        = false
 		bufferedPackages  []rawSPDXPackage
 		bufferedEdges     []rawSPDXRelationship
 		describedElements = make(map[string]bool)
@@ -182,6 +171,7 @@ func parseSPDXJSONStream(r io.Reader, emit func(any) error, opts Options) error 
 			_ = dec.Decode(&s)
 			if s != "" {
 				specVersion = s
+				sawVersion = true
 			}
 		case "name":
 			_ = dec.Decode(&docName)
@@ -248,6 +238,12 @@ func parseSPDXJSONStream(r io.Reader, emit func(any) error, opts Options) error 
 		}
 	}
 
+	// An SPDX 2.x document always names its version. Without it the input is not SPDX, and saying "SPDX 2.3" for it
+	// would store an empty inventory as if it were the document.
+	if !sawVersion {
+		return fmt.Errorf("not an SPDX document: no spdxVersion")
+	}
+
 	// If rootRef is not established by DESCRIBES, check if the first package matches document name or fallback to first
 	if rootRef == "" && len(bufferedPackages) > 0 {
 		for _, pkg := range bufferedPackages {
@@ -276,13 +272,9 @@ func parseSPDXJSONStream(r io.Reader, emit func(any) error, opts Options) error 
 	// 2. Emit ComponentEvents
 	for _, pkg := range bufferedPackages {
 		purl := ""
-		cpe := ""
 		for _, ref := range pkg.ExternalRefs {
-			refType := strings.ToLower(ref.ReferenceType)
-			if refType == "purl" {
+			if strings.ToLower(ref.ReferenceType) == "purl" {
 				purl = ref.ReferenceLocator
-			} else if strings.HasPrefix(refType, "cpe") {
-				cpe = ref.ReferenceLocator
 			}
 		}
 
@@ -317,15 +309,6 @@ func parseSPDXJSONStream(r io.Reader, emit func(any) error, opts Options) error 
 			IsRoot:   isRoot,
 		})
 
-		if opts.ExtractVulnerabilities && cpe != "" {
-			// If options ask for vulnerability annotations
-			_ = emit(VulnerabilityEvent{
-				Type:        EventVulnerability,
-				ID:          "CPE:" + cpe,
-				AffectedRef: pkg.SPDXID,
-				Description: "CPE identifier for package " + pkg.Name,
-			})
-		}
 	}
 
 	// 3. Emit EdgeEvents
@@ -334,26 +317,30 @@ func parseSPDXJSONStream(r io.Reader, emit func(any) error, opts Options) error 
 		from := rel.SpdxElementId
 		to := rel.RelatedSpdxElement
 
-		switch relType {
-		case "DEPENDS_ON", "CONTAINS", "DYNAMIC_LINK", "STATIC_LINK":
-			_ = emit(EdgeEvent{
-				Type:   EventEdge,
-				From:   from,
-				To:     to,
-				Direct: from == rootRef,
-			})
-		case "DEPENDENCY_OF", "CONTAINED_BY":
-			_ = emit(EdgeEvent{
-				Type:   EventEdge,
-				From:   to,
-				To:     from,
-				Direct: to == rootRef,
-			})
+		switch edgeDirection(relType) {
+		case 1:
+			_ = emit(EdgeEvent{Type: EventEdge, From: from, To: to, Direct: from == rootRef})
+		case -1:
+			_ = emit(EdgeEvent{Type: EventEdge, From: to, To: from, Direct: to == rootRef})
 		}
 	}
 
 	_ = emittedMetadata
 	return nil
+}
+
+// edgeDirection says what a relationship type means for the dependency graph: 1 when A depends on B, -1 when A is a
+// dependency of B (the same edge, written the other way round), 0 when it says nothing about dependencies. The
+// spellings of SPDX 2 (DEPENDS_ON) and of SPDX 3 (dependsOn) are the same relation.
+func edgeDirection(relType string) int {
+	switch strings.ToUpper(strings.ReplaceAll(strings.TrimSpace(relType), "_", "")) {
+	case "DEPENDSON", "HASDEPENDENCY", "CONTAINS", "DYNAMICLINK", "STATICLINK":
+		return 1
+	case "DEPENDENCYOF", "BUILDDEPENDENCYOF", "DEVDEPENDENCYOF", "OPTIONALDEPENDENCYOF", "PROVIDEDDEPENDENCYOF",
+		"TESTDEPENDENCYOF", "RUNTIMEDEPENDENCYOF", "CONTAINEDBY":
+		return -1
+	}
+	return 0
 }
 
 func parseSPDXTagValueStream(r io.Reader, emit func(any) error, opts Options) error {
@@ -362,6 +349,7 @@ func parseSPDXTagValueStream(r io.Reader, emit func(any) error, opts Options) er
 	var (
 		format       = "SPDX"
 		specVersion  = "SPDX-2.3"
+		sawVersion   = false
 		docName      = ""
 		docNamespace = ""
 		rootRef      = ""
@@ -412,6 +400,7 @@ func parseSPDXTagValueStream(r io.Reader, emit func(any) error, opts Options) er
 		switch tag {
 		case "SPDXVersion":
 			specVersion = val
+			sawVersion = val != ""
 		case "DocumentName":
 			docName = val
 		case "DocumentNamespace":
@@ -478,18 +467,13 @@ func parseSPDXTagValueStream(r io.Reader, emit func(any) error, opts Options) er
 					if strings.EqualFold(to, "SPDXRef-DOCUMENT") || rootRef == "" {
 						rootRef = from
 					}
-				case "DEPENDS_ON", "CONTAINS", "DYNAMIC_LINK", "STATIC_LINK":
-					edges = append(edges, EdgeEvent{
-						Type: EventEdge,
-						From: from,
-						To:   to,
-					})
-				case "DEPENDENCY_OF", "CONTAINED_BY":
-					edges = append(edges, EdgeEvent{
-						Type: EventEdge,
-						From: to,
-						To:   from,
-					})
+				default:
+					switch edgeDirection(relType) {
+					case 1:
+						edges = append(edges, EdgeEvent{Type: EventEdge, From: from, To: to})
+					case -1:
+						edges = append(edges, EdgeEvent{Type: EventEdge, From: to, To: from})
+					}
 				}
 			}
 		}
@@ -498,6 +482,10 @@ func parseSPDXTagValueStream(r io.Reader, emit func(any) error, opts Options) er
 
 	if err := scanner.Err(); err != nil {
 		return fmt.Errorf("tag-value scan error: %w", err)
+	}
+
+	if !sawVersion {
+		return fmt.Errorf("not an SPDX document: no SPDXVersion tag")
 	}
 
 	if rootRef == "" && len(packages) > 0 {
@@ -542,14 +530,6 @@ func parseSPDXTagValueStream(r io.Reader, emit func(any) error, opts Options) er
 			IsRoot:   pkg.SPDXID == rootRef,
 		})
 
-		if opts.ExtractVulnerabilities && pkg.CPE != "" {
-			_ = emit(VulnerabilityEvent{
-				Type:        EventVulnerability,
-				ID:          "CPE:" + pkg.CPE,
-				AffectedRef: pkg.SPDXID,
-				Description: "CPE identifier for package " + pkg.Name,
-			})
-		}
 	}
 
 	// 3. Emit EdgeEvents
@@ -618,20 +598,12 @@ func parseSPDX3Stream(dec *json.Decoder, emit func(any) error, opts Options) err
 			}
 			normRel := strings.ToLower(relType)
 			for _, target := range targets {
-				switch normRel {
-				case "dependson", "contains", "hasdependency":
-					edges = append(edges, EdgeEvent{
-						Type: EventEdge,
-						From: from,
-						To:   target,
-					})
-				case "dependencyof", "containedby":
-					edges = append(edges, EdgeEvent{
-						Type: EventEdge,
-						From: target,
-						To:   from,
-					})
-				case "describes":
+				switch d := edgeDirection(relType); {
+				case d == 1:
+					edges = append(edges, EdgeEvent{Type: EventEdge, From: from, To: target})
+				case d == -1:
+					edges = append(edges, EdgeEvent{Type: EventEdge, From: target, To: from})
+				case normRel == "describes":
 					rootRef = target
 				}
 			}

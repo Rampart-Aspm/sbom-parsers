@@ -1,0 +1,12 @@
+# Which default SBOM readers are installed. All are on. `defaultSBOMParsers.enabled: false` installs none. The shape is the one
+# Rampart's own chart has always had (sbomParsers.defaultSBOMParsers), so a Rampart release that includes this chart as
+# `sbomParsers` keeps its values. A reader is named without its `sbom-` prefix.
+defaultSBOMParsers:
+  enabled: true
+  cyclonedx:
+    enabled: true
+    # Turn the vulnerabilities a CycloneDX document states (a VDR) into findings, besides filling the inventory.
+    # Off: an SBOM is assets, and what is found in it is the matcher's work (D131).
+    extractVulnerabilities: false
+  spdx: {enabled: true}
+  syft: {enabled: true}
