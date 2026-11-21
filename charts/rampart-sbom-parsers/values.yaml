@@ -8,5 +8,11 @@ defaultSBOMParsers:
     # Turn the vulnerabilities a CycloneDX document states (a VDR) into findings, besides filling the inventory.
     # Off: an SBOM is assets, and what is found in it is the matcher's work (D131).
     extractVulnerabilities: false
-  spdx: {enabled: true}
+    extractVEX: true
+  openvex:
+    enabled: true
+    extractVEX: true
+  spdx:
+    enabled: true
+    extractVEX: false
   syft: {enabled: true}

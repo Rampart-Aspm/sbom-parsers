@@ -8,5 +8,10 @@
 {{- $_ := set $opts "extractVulnerabilities" .one.extractVulnerabilities -}}
 {{- $_ := set $m.spec "options" $opts -}}
 {{- end -}}
+{{- if hasKey .one "extractVEX" -}}
+{{- $opts := default dict $m.spec.options -}}
+{{- $_ := set $opts "extractVEX" .one.extractVEX -}}
+{{- $_ := set $m.spec "options" $opts -}}
+{{- end -}}
 {{- toYaml $m -}}
 {{- end -}}
