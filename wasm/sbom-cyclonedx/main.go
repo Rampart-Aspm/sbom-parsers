@@ -7,7 +7,10 @@ import (
 )
 
 func main() {
-	opts := Options{ExtractVulnerabilities: envTrue("EXTRACT_VULNERABILITIES")}
+	opts := Options{
+		ExtractVulnerabilities: envTrue("EXTRACT_VULNERABILITIES"),
+		ExtractVEX:             envTrue("EXTRACT_VEX"),
+	}
 	if err := ParseCycloneDXStream(os.Stdin, os.Stdout, opts); err != nil {
 		fmt.Fprintf(os.Stderr, "cyclonedx sbom parser error: %v\n", err)
 		os.Exit(1)

@@ -407,3 +407,88 @@ func TestCycloneDX_Wasm_NestedComponentsAreComponents(t *testing.T) {
 		t.Errorf("XML: components %v, edges %v", comps, edges)
 	}
 }
+
+func TestCycloneDX_Wasm_EmbeddedVEX(t *testing.T) {
+	ctx := context.Background()
+	wasmCode, err := os.ReadFile(compileWasm(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	vexStatements := func(stdout []byte) []map[string]any {
+		var out []map[string]any
+		sc := bufio.NewScanner(bytes.NewReader(stdout))
+		for sc.Scan() {
+			var ev map[string]any
+			_ = json.Unmarshal(sc.Bytes(), &ev)
+			if ev["type"] == "vex_statement" {
+				out = append(out, ev)
+			}
+		}
+		return out
+	}
+
+	jsonDoc := `{
+		"bomFormat": "CycloneDX",
+		"specVersion": "1.5",
+		"components": [
+			{"bom-ref": "comp-lodash", "name": "lodash", "version": "4.17.20", "purl": "pkg:npm/lodash@4.17.20"}
+		],
+		"vulnerabilities": [
+			{
+				"id": "CVE-2021-23337",
+				"analysis": {
+					"state": "not_affected",
+					"justification": "code_not_reachable",
+					"detail": "Template path is never called"
+				},
+				"affects": [{"ref": "comp-lodash"}]
+			}
+		]
+	}`
+
+	stdout, stderr, err := runWasm(ctx, t, wasmCode, []byte(jsonDoc), []string{"EXTRACT_VEX=true"})
+	if err != nil {
+		t.Fatalf("JSON EXTRACT_VEX failed: %v\n%s", err, stderr)
+	}
+	stmts := vexStatements(stdout)
+	if len(stmts) != 1 || stmts[0]["vulnerability"] != "CVE-2021-23337" || stmts[0]["status"] != "not_affected" ||
+		stmts[0]["justification"] != "vulnerable_code_not_in_execute_path" || stmts[0]["purl"] != "pkg:npm/lodash@4.17.20" {
+		t.Fatalf("unexpected JSON vex statements: %+v", stmts)
+	}
+
+	// Off: zero vex_statement events
+	stdoutOff, stderr, err := runWasm(ctx, t, wasmCode, []byte(jsonDoc), nil)
+	if err != nil {
+		t.Fatalf("JSON off failed: %v\n%s", err, stderr)
+	}
+	if got := vexStatements(stdoutOff); len(got) != 0 {
+		t.Fatalf("expected 0 vex statements when EXTRACT_VEX is off, got %+v", got)
+	}
+
+	// XML with embedded VEX
+	xmlDoc := `<?xml version="1.0"?>
+<bom xmlns="http://cyclonedx.org/schema/bom/1.5" version="1">
+  <components>
+    <component type="library" bom-ref="comp-grpc"><name>grpc</name><version>1.58.2</version><purl>pkg:golang/google.golang.org/grpc@v1.58.2</purl></component>
+  </components>
+  <vulnerabilities>
+    <vulnerability>
+      <id>CVE-2023-44487</id>
+      <analysis>
+        <state>in_triage</state>
+        <detail>Checking HTTP/2 limits</detail>
+      </analysis>
+      <affects><target><ref>comp-grpc</ref></target></affects>
+    </vulnerability>
+  </vulnerabilities>
+</bom>`
+	stdoutXML, stderr, err := runWasm(ctx, t, wasmCode, []byte(xmlDoc), []string{"EXTRACT_VEX=true"})
+	if err != nil {
+		t.Fatalf("XML EXTRACT_VEX failed: %v\n%s", err, stderr)
+	}
+	xmlStmts := vexStatements(stdoutXML)
+	if len(xmlStmts) != 1 || xmlStmts[0]["vulnerability"] != "CVE-2023-44487" || xmlStmts[0]["status"] != "under_investigation" || xmlStmts[0]["purl"] != "pkg:golang/google.golang.org/grpc@v1.58.2" {
+		t.Fatalf("unexpected XML vex statements: %+v", xmlStmts)
+	}
+}

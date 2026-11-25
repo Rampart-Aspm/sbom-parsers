@@ -18,6 +18,8 @@ type Options struct {
 	// section (a VDR). It is off by default: an SBOM is assets, and what is found in it is the matcher's work. It reads
 	// that section only: never the CPE of a component, which is a guess and not a statement.
 	ExtractVulnerabilities bool
+	// ExtractVEX emits VEX exploitability assertions from vulnerabilities[].analysis (CycloneDX VEX).
+	ExtractVEX bool
 }
 
 // Event types emitted as JSONL to stdout
@@ -27,7 +29,23 @@ const (
 	EventEdge      = "edge"
 
 	EventVulnerability = "vulnerability"
+	EventVEXStatement  = "vex_statement"
 )
+
+// VEXStatementEvent is one VEX exploitability statement derived from a CycloneDX vulnerability analysis.
+type VEXStatementEvent struct {
+	Type            string   `json:"type"`
+	Vulnerability   string   `json:"vulnerability"`
+	Aliases         []string `json:"aliases,omitempty"`
+	Purl            string   `json:"purl,omitempty"`
+	PurlBase        string   `json:"purl_base,omitempty"`
+	AffectedRef     string   `json:"affected_ref,omitempty"`
+	Status          string   `json:"status"`
+	Justification   string   `json:"justification,omitempty"`
+	ImpactStatement string   `json:"impact_statement,omitempty"`
+	ActionStatement string   `json:"action_statement,omitempty"`
+	Timestamp       string   `json:"timestamp,omitempty"`
+}
 
 // VulnerabilityEvent is one vulnerability a VDR states about one component (one event per affected reference).
 type VulnerabilityEvent struct {
@@ -142,6 +160,18 @@ type cdxVulnerability struct {
 	References []struct {
 		ID string `json:"id"`
 	} `json:"references"`
+	Analysis struct {
+		State         string   `json:"state"`
+		Justification string   `json:"justification"`
+		Response      []string `json:"response"`
+		Detail        string   `json:"detail"`
+		FirstIssued   string   `json:"firstIssued"`
+		LastUpdated   string   `json:"lastUpdated"`
+	} `json:"analysis"`
+	Properties []struct {
+		Name  string `json:"name"`
+		Value string `json:"value"`
+	} `json:"properties"`
 }
 
 // raw structures for unmarshal (XML)
@@ -156,6 +186,7 @@ type cdxXMLDocument struct {
 }
 
 type cdxXMLMetadata struct {
+	Timestamp string           `xml:"timestamp"`
 	Component *cdxXMLComponent `xml:"component"`
 }
 
@@ -201,6 +232,22 @@ type cdxXMLVulnerability struct {
 	Ratings     []cdxXMLRating     `xml:"ratings>rating"`
 	CWEs        []int              `xml:"cwes>cwe"`
 	Affects     []cdxXMLAffectsRef `xml:"affects>target"`
+	Analysis    cdxXMLAnalysis     `xml:"analysis"`
+	Properties  []cdxXMLProperty   `xml:"properties>property"`
+}
+
+type cdxXMLAnalysis struct {
+	State         string   `xml:"state"`
+	Justification string   `xml:"justification"`
+	Responses     []string `xml:"responses>response"`
+	Detail        string   `xml:"detail"`
+	FirstIssued   string   `xml:"firstIssued"`
+	LastUpdated   string   `xml:"lastUpdated"`
+}
+
+type cdxXMLProperty struct {
+	Name  string `xml:"name,attr"`
+	Value string `xml:",chardata"`
 }
 
 type cdxXMLSource struct {
@@ -315,8 +362,16 @@ func parseCycloneDXXMLStream(r io.Reader, w io.Writer, opts Options) error {
 		RootRef:      rootRef,
 	})
 
+	refPurl := make(map[string]string)
+	docTimestamp := ""
+	if doc.Metadata != nil {
+		docTimestamp = doc.Metadata.Timestamp
+	}
 	if doc.Metadata != nil && doc.Metadata.Component != nil && doc.Metadata.Component.Name != "" {
 		c := doc.Metadata.Component
+		if rootRef != "" && c.Purl != "" {
+			refPurl[rootRef] = c.Purl
+		}
 		purlBase := ""
 		if c.Purl != "" {
 			_, purlBase, _ = normalize.CanonicalPURL(c.Purl)
@@ -335,6 +390,9 @@ func parseCycloneDXXMLStream(r io.Reader, w io.Writer, opts Options) error {
 
 	for _, comp := range doc.Components {
 		for _, ev := range xmlComponentEvents(comp, rootRef) {
+			if ev.Ref != "" && ev.Purl != "" {
+				refPurl[ev.Ref] = ev.Purl
+			}
 			_ = emit(ev)
 		}
 	}
@@ -367,17 +425,32 @@ func parseCycloneDXXMLStream(r io.Reader, w io.Writer, opts Options) error {
 		}
 	}
 
-	if opts.ExtractVulnerabilities {
-		for _, v := range doc.Vulns {
+	for _, v := range doc.Vulns {
+		refs := make([]string, 0, len(v.Affects))
+		for _, a := range v.Affects {
+			refs = append(refs, a.Ref)
+		}
+		if opts.ExtractVulnerabilities {
 			ratings := make([]rating, 0, len(v.Ratings))
 			for _, r := range v.Ratings {
 				ratings = append(ratings, rating{severity: r.Severity, score: float64(r.Score), vector: r.Vector})
 			}
-			refs := make([]string, 0, len(v.Affects))
-			for _, a := range v.Affects {
-				refs = append(refs, a.Ref)
-			}
 			if err := emitVulnerability(emit, v.ID, v.Source.Name, v.Description, v.Detail, ratings, v.CWEs, refs, nil); err != nil {
+				return err
+			}
+		}
+		if opts.ExtractVEX && strings.TrimSpace(v.Analysis.State) != "" {
+			var ownJust, ownAction string
+			for _, p := range v.Properties {
+				switch p.Name {
+				case "rampart:justification":
+					ownJust = strings.TrimSpace(p.Value)
+				case "rampart:action":
+					ownAction = strings.TrimSpace(p.Value)
+				}
+			}
+			ts := firstNonEmptyStr(v.Analysis.LastUpdated, v.Analysis.FirstIssued, docTimestamp)
+			if err := emitCycloneDXVEX(emit, refPurl, v.ID, nil, refs, v.Analysis.State, v.Analysis.Justification, v.Analysis.Responses, v.Analysis.Detail, ownJust, ownAction, ts); err != nil {
 				return err
 			}
 		}
@@ -549,7 +622,10 @@ func parseCycloneDXJSONStream(r io.Reader, w io.Writer, opts Options) error {
 		specVersion  = "1.4"
 		serialNumber string
 		rootRef      string
+		docTimestamp string
 		directSet    = make(map[string]bool)
+		refPurl      = make(map[string]string)
+		pendingVEX   []cdxVulnerability
 	)
 
 	// Stream root keys
@@ -582,10 +658,16 @@ func parseCycloneDXJSONStream(r io.Reader, w io.Writer, opts Options) error {
 		case "metadata":
 			var meta cdxMetadata
 			if err := dec.Decode(&meta); err == nil {
+				if meta.Timestamp != "" {
+					docTimestamp = meta.Timestamp
+				}
 				if meta.Component != nil {
 					rootRef = meta.Component.BOMRef
 					if rootRef == "" {
 						rootRef = meta.Component.Purl
+					}
+					if rootRef != "" && meta.Component.Purl != "" {
+						refPurl[rootRef] = meta.Component.Purl
 					}
 				}
 				_ = emit(MetadataEvent{
@@ -626,6 +708,9 @@ func parseCycloneDXJSONStream(r io.Reader, w io.Writer, opts Options) error {
 				}
 
 				for _, ev := range jsonComponentEvents(comp, rootRef) {
+					if ev.Ref != "" && ev.Purl != "" {
+						refPurl[ev.Ref] = ev.Purl
+					}
 					_ = emit(ev)
 				}
 			}
@@ -679,7 +764,7 @@ func parseCycloneDXJSONStream(r io.Reader, w io.Writer, opts Options) error {
 			}
 
 		case "vulnerabilities":
-			if !opts.ExtractVulnerabilities {
+			if !opts.ExtractVulnerabilities && !opts.ExtractVEX {
 				if err := skipValue(dec); err != nil {
 					return err
 				}
@@ -693,22 +778,27 @@ func parseCycloneDXJSONStream(r io.Reader, w io.Writer, opts Options) error {
 				if err := dec.Decode(&v); err != nil {
 					return fmt.Errorf("reading a vulnerability: %w", err)
 				}
-				ratings := make([]rating, 0, len(v.Ratings))
-				for _, r := range v.Ratings {
-					ratings = append(ratings, rating{severity: r.Severity, score: r.Score, vector: r.Vector})
-				}
-				refs := make([]string, 0, len(v.Affects))
-				for _, a := range v.Affects {
-					refs = append(refs, a.Ref)
-				}
-				var aliases []string
-				for _, r := range v.References {
-					if r.ID != "" && r.ID != v.ID {
-						aliases = append(aliases, r.ID)
+				if opts.ExtractVulnerabilities {
+					ratings := make([]rating, 0, len(v.Ratings))
+					for _, r := range v.Ratings {
+						ratings = append(ratings, rating{severity: r.Severity, score: r.Score, vector: r.Vector})
+					}
+					refs := make([]string, 0, len(v.Affects))
+					for _, a := range v.Affects {
+						refs = append(refs, a.Ref)
+					}
+					var aliases []string
+					for _, r := range v.References {
+						if r.ID != "" && r.ID != v.ID {
+							aliases = append(aliases, r.ID)
+						}
+					}
+					if err := emitVulnerability(emit, v.ID, v.Source.Name, v.Description, v.Detail, ratings, v.CWEs, refs, aliases); err != nil {
+						return err
 					}
 				}
-				if err := emitVulnerability(emit, v.ID, v.Source.Name, v.Description, v.Detail, ratings, v.CWEs, refs, aliases); err != nil {
-					return err
+				if opts.ExtractVEX && strings.TrimSpace(v.Analysis.State) != "" {
+					pendingVEX = append(pendingVEX, v)
 				}
 			}
 			if err := expectDelim(dec, ']'); err != nil {
@@ -722,7 +812,129 @@ func parseCycloneDXJSONStream(r io.Reader, w io.Writer, opts Options) error {
 		}
 	}
 
+	if opts.ExtractVEX {
+		for _, v := range pendingVEX {
+			refs := make([]string, 0, len(v.Affects))
+			for _, a := range v.Affects {
+				refs = append(refs, a.Ref)
+			}
+			var aliases []string
+			for _, r := range v.References {
+				if r.ID != "" && r.ID != v.ID {
+					aliases = append(aliases, r.ID)
+				}
+			}
+			var ownJust, ownAction string
+			for _, p := range v.Properties {
+				switch p.Name {
+				case "rampart:justification":
+					ownJust = strings.TrimSpace(p.Value)
+				case "rampart:action":
+					ownAction = strings.TrimSpace(p.Value)
+				}
+			}
+			ts := firstNonEmptyStr(v.Analysis.LastUpdated, v.Analysis.FirstIssued, docTimestamp)
+			if err := emitCycloneDXVEX(emit, refPurl, v.ID, aliases, refs, v.Analysis.State, v.Analysis.Justification, v.Analysis.Response, v.Analysis.Detail, ownJust, ownAction, ts); err != nil {
+				return err
+			}
+		}
+	}
+
 	return nil
+}
+
+var cdxVEXJustificationMap = map[string]string{
+	"code_not_present":                "vulnerable_code_not_present",
+	"code_not_reachable":              "vulnerable_code_not_in_execute_path",
+	"requires_configuration":          "vulnerable_code_cannot_be_controlled_by_adversary",
+	"requires_dependency":             "vulnerable_code_cannot_be_controlled_by_adversary",
+	"requires_environment":            "vulnerable_code_cannot_be_controlled_by_adversary",
+	"protected_by_compiler":           "inline_mitigations_already_exist",
+	"protected_at_runtime":            "inline_mitigations_already_exist",
+	"protected_at_perimeter":          "inline_mitigations_already_exist",
+	"protected_by_mitigating_control": "inline_mitigations_already_exist",
+}
+
+func emitCycloneDXVEX(emit func(any) error, refPurl map[string]string, vulnID string, aliases, refs []string, rawState, rawJust string, responses []string, detail, ownJust, ownAction, ts string) error {
+	if strings.TrimSpace(vulnID) == "" {
+		return nil
+	}
+	var status string
+	switch strings.ToLower(strings.TrimSpace(rawState)) {
+	case "not_affected", "false_positive":
+		status = "not_affected"
+	case "exploitable", "affected":
+		status = "affected"
+	case "resolved", "resolved_with_pedigree", "fixed":
+		status = "fixed"
+	case "in_triage", "under_investigation":
+		status = "under_investigation"
+	default:
+		return nil
+	}
+	justification := ownJust
+	if justification == "" {
+		j := strings.TrimSpace(rawJust)
+		if mapped, ok := cdxVEXJustificationMap[strings.ToLower(j)]; ok {
+			justification = mapped
+		} else if j != "" {
+			justification = j
+		}
+	}
+	if status == "not_affected" && justification == "" && strings.EqualFold(strings.TrimSpace(rawState), "false_positive") {
+		justification = "vulnerable_code_not_present"
+	}
+	action := ownAction
+	if action == "" && len(responses) > 0 {
+		action = strings.Join(responses, ", ")
+	}
+	if len(refs) == 0 {
+		return emit(VEXStatementEvent{
+			Type:            EventVEXStatement,
+			Vulnerability:   vulnID,
+			Aliases:         aliases,
+			Status:          status,
+			Justification:   justification,
+			ImpactStatement: detail,
+			ActionStatement: action,
+			Timestamp:       ts,
+		})
+	}
+	for _, ref := range refs {
+		purl := refPurl[ref]
+		if purl == "" && strings.HasPrefix(ref, "pkg:") {
+			purl = ref
+		}
+		purlBase := ""
+		if purl != "" {
+			_, purlBase, _ = normalize.CanonicalPURL(purl)
+		}
+		if err := emit(VEXStatementEvent{
+			Type:            EventVEXStatement,
+			Vulnerability:   vulnID,
+			Aliases:         aliases,
+			Purl:            purl,
+			PurlBase:        purlBase,
+			AffectedRef:     ref,
+			Status:          status,
+			Justification:   justification,
+			ImpactStatement: detail,
+			ActionStatement: action,
+			Timestamp:       ts,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func firstNonEmptyStr(vals ...string) string {
+	for _, s := range vals {
+		if strings.TrimSpace(s) != "" {
+			return strings.TrimSpace(s)
+		}
+	}
+	return ""
 }
 
 func expectDelim(dec *json.Decoder, d json.Delim) error {
