@@ -53,7 +53,59 @@ type openVEXStatement struct {
 }
 
 type openVEXProduct struct {
-	ID string `json:"@id"`
+	ID            string
+	Purl          string
+	Subcomponents []openVEXProduct
+}
+
+func (p *openVEXProduct) UnmarshalJSON(b []byte) error {
+	var s string
+	if json.Unmarshal(b, &s) == nil {
+		p.ID = s
+		if strings.HasPrefix(s, "pkg:") {
+			p.Purl = s
+		}
+		return nil
+	}
+	var o struct {
+		ID          string `json:"@id"`
+		Identifiers struct {
+			Purl string `json:"purl"`
+		} `json:"identifiers"`
+		Subcomponents []openVEXProduct `json:"subcomponents"`
+	}
+	if err := json.Unmarshal(b, &o); err != nil {
+		return err
+	}
+	p.ID = o.ID
+	p.Subcomponents = o.Subcomponents
+	p.Purl = o.Identifiers.Purl
+	if p.Purl == "" && strings.HasPrefix(o.ID, "pkg:") {
+		p.Purl = o.ID
+	}
+	return nil
+}
+
+func productPURLs(products []openVEXProduct) []string {
+	seen := make(map[string]bool)
+	var purls []string
+	add := func(p string) {
+		p = strings.TrimSpace(p)
+		if p != "" && !seen[p] {
+			seen[p] = true
+			purls = append(purls, p)
+		}
+	}
+	for _, p := range products {
+		if len(p.Subcomponents) > 0 {
+			for _, sc := range p.Subcomponents {
+				add(sc.Purl)
+			}
+		} else {
+			add(p.Purl)
+		}
+	}
+	return purls
 }
 
 func ParseOpenVEXStream(r io.Reader, w io.Writer, opts Options) error {
@@ -95,12 +147,12 @@ func ParseOpenVEXStream(r io.Reader, w io.Writer, opts Options) error {
 			continue
 		}
 
-		purls := make([]string, 0, len(st.Products))
-		for _, p := range st.Products {
-			if p.ID != "" {
-				purls = append(purls, p.ID)
-			}
+		ts := strings.TrimSpace(st.Timestamp)
+		if ts == "" {
+			ts = strings.TrimSpace(doc.Timestamp)
 		}
+
+		purls := productPURLs(st.Products)
 
 		if len(purls) == 0 {
 			_ = enc.Encode(VEXStatementEvent{
@@ -111,7 +163,7 @@ func ParseOpenVEXStream(r io.Reader, w io.Writer, opts Options) error {
 				Justification:   st.Justification,
 				ImpactStatement: st.ImpactStatement,
 				ActionStatement: st.ActionStatement,
-				Timestamp:       st.Timestamp,
+				Timestamp:       ts,
 			})
 			continue
 		}
@@ -128,7 +180,7 @@ func ParseOpenVEXStream(r io.Reader, w io.Writer, opts Options) error {
 				Justification:   st.Justification,
 				ImpactStatement: st.ImpactStatement,
 				ActionStatement: st.ActionStatement,
-				Timestamp:       st.Timestamp,
+				Timestamp:       ts,
 			})
 		}
 	}
